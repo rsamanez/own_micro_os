@@ -1,0 +1,22 @@
+# Archivos generados
+build/
+iso/
+*.iso
+*.img
+*.bin
+*.o
+
+# Sistema operativo
+os.img
+
+# Editor
+.vscode/
+*.swp
+*.swo
+*~
+
+# macOS
+.DS_Store
+
+# Debug
+*.log
