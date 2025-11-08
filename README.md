@@ -1,240 +1,437 @@
-# MicroKernel OS - x86_64
+# Micro OS - Bootloader 64-bit con Kernel en C
 
-Un sistema operativo con arquitectura de microkernel inspirado en MINIX, diseñado para x86_64 desde cero (sin GRUB).
+Sistema operativo minimalista que arranca en modo real (16-bit), pasa por modo protegido (32-bit) y finalmente entra en modo largo (64-bit) para ejecutar un kernel escrito en C.
 
-## 🎯 Características
+## 🎯 Objetivo del Proyecto
 
-- **Arquitectura**: x86-64 (64 bits)
-- **Filosofía**: Microkernel (inspirado en MINIX)
-- **Bootloader**: 100% custom, escrito desde cero en Assembly (2 etapas)
-- **Modo de operación**: Long Mode (64 bits)
-- **Sin dependencias**: No usa GRUB ni ningún bootloader externo
+Crear un bootloader personalizado capaz de:
+1. Arrancar desde el MBR (Master Boot Record)
+2. Transicionar a través de los modos: 16-bit → 32-bit → 64-bit
+3. Cargar el kernel desde disco **en modo 64-bit** (sin BIOS)
+4. Ejecutar código en C con acceso directo a memoria VGA
+
+## 📋 Arquitectura del Sistema
+
+### Distribución en Disco (sector2.img)
+```
+Sector 0      : Stage1 (boot.asm) - MBR bootloader
+Sectores 1-16 : Stage2 (stage2_sector2.asm) - Transición a 64-bit
+Sector 17+    : Kernel (kernel.c + entry.asm) - Kernel en C
+```
+
+### Mapa de Memoria
+```
+0x00007C00  : Stage1 (cargado por BIOS)
+0x00001000  : Stage2 (cargado por Stage1)
+0x00010000  : Kernel (cargado por Stage2 con driver ATA)
+0x00070000  : Page Tables (identity paging)
+0x00090000  : Stack del kernel
+0x000B8000  : Memoria VGA text mode
+```
+
+## 🚀 Paso a Paso: Cómo se Logró la Carga del Kernel en C
+
+### **Paso 1: Stage1 - Bootloader MBR (boot.asm)**
+
+El BIOS carga el primer sector (512 bytes) en `0x7C00` y lo ejecuta.
+
+**Responsabilidades:**
+- Iniciar en modo real (16-bit)
+- Cargar Stage2 desde disco usando INT 0x13 (BIOS)
+- Transferir control a Stage2
+
+```assembly
+; Lee 16 sectores de Stage2 desde disco
+mov ah, 0x02        ; Función BIOS: leer sectores
+mov al, 16          ; Cantidad de sectores
+mov ch, 0           ; Cilindro 0
+mov cl, 2           ; Sector 2 (después del MBR)
+mov dh, 0           ; Cabeza 0
+mov bx, 0x1000      ; Destino: 0x1000
+int 0x13            ; Interrupción BIOS
+```
+
+**Importante:** Stage1 **NO** carga el kernel. Solo carga Stage2.
+
+---
+
+### **Paso 2: Stage2 - Transición a 64-bit (stage2_sector2.asm)**
+
+Stage2 realiza la transición completa de modos y carga el kernel.
+
+#### 2.1 Modo Protegido (32-bit)
+- Deshabilita interrupciones
+- Configura GDT (Global Descriptor Table)
+- Habilita A20 line
+- Entra en modo protegido
+
+#### 2.2 Preparación para Modo Largo (64-bit)
+- Verifica soporte CPUID
+- Verifica soporte de Long Mode
+- Configura identity paging en `0x70000`:
+  - PML4 → PDPT → PD → PT (4 niveles de paginación)
+  - Mapeo identidad: dirección virtual = dirección física
+
+#### 2.3 Entrada a Modo Largo
+```assembly
+; Habilitar PAE (Physical Address Extension)
+mov eax, cr4
+or eax, 1 << 5
+mov cr4, eax
+
+; Cargar PML4 en CR3
+mov eax, 0x70000
+mov cr3, eax
+
+; Habilitar Long Mode en EFER MSR
+mov ecx, 0xC0000080
+rdmsr
+or eax, 1 << 8
+wrmsr
+
+; Habilitar paginación
+mov eax, cr0
+or eax, 1 << 31
+mov cr0, eax
+```
+
+#### 2.4 **CLAVE: Carga del Kernel en 64-bit**
+
+Una vez en modo 64-bit, Stage2 utiliza el **driver ATA** para leer el kernel desde disco.
+
+**¿Por qué no usar BIOS INT 0x13?**
+- Las interrupciones BIOS **solo funcionan en modo real (16-bit)**
+- En modo 64-bit no hay acceso a BIOS
+- Solución: acceso directo al controlador ATA por I/O ports
+
+```assembly
+; Cargar kernel desde disco usando driver ATA
+mov rdi, 0x10000        ; Destino en memoria
+mov rsi, 17             ; LBA sector 17
+mov rdx, 8              ; 8 sectores (4KB)
+call ata_read_sectors   ; Driver ATA personalizado
+```
+
+---
+
+### **Paso 3: Driver ATA en 64-bit (ata_driver64.asm)**
+
+El driver ATA permite leer sectores del disco directamente desde modo 64-bit sin depender del BIOS.
+
+#### Puertos ATA (Primary IDE Controller)
+```
+0x1F0 : Data port (lectura/escritura de datos)
+0x1F2 : Sector count
+0x1F3 : LBA low byte
+0x1F4 : LBA mid byte
+0x1F5 : LBA high byte
+0x1F6 : Drive select + LBA bits 24-27
+0x1F7 : Command/Status port
+```
+
+#### Proceso de Lectura
+```assembly
+ata_read_sectors:
+    ; 1. Esperar a que el disco esté listo
+    mov dx, 0x1F7
+.wait_ready:
+    in al, dx
+    test al, 0x80        ; BSY bit
+    jnz .wait_ready
+    
+    ; 2. Configurar sector count
+    mov dx, 0x1F2
+    mov al, [sector_count]
+    out dx, al
+    
+    ; 3. Configurar LBA (28-bit addressing)
+    mov dx, 0x1F3
+    mov al, [lba_low]
+    out dx, al
+    ; ... (continúa con LBA mid, high)
+    
+    ; 4. Enviar comando READ (0x20)
+    mov dx, 0x1F7
+    mov al, 0x20
+    out dx, al
+    
+    ; 5. Leer datos word por word (512 bytes por sector)
+    mov dx, 0x1F0
+    mov rcx, 256         ; 256 words = 512 bytes
+.read_loop:
+    in ax, dx
+    mov [rdi], ax
+    add rdi, 2
+    loop .read_loop
+```
+
+**Ventaja crítica:** Funciona en cualquier modo (16, 32, 64 bits) ya que usa I/O ports directamente.
+
+---
+
+### **Paso 4: Kernel en C (kernel.c + entry.asm)**
+
+#### 4.1 Entry Point en Assembly (entry.asm)
+```assembly
+[BITS 64]
+extern kernel_main
+
+global _start
+_start:
+    ; Configurar stack
+    mov rsp, 0x90000
+    xor rbp, rbp
+    
+    ; Llamar función en C
+    call kernel_main
+    
+    ; Halt si regresa
+.halt:
+    hlt
+    jmp .halt
+```
+
+#### 4.2 Kernel Principal en C (kernel.c)
+```c
+// Acceso directo a memoria VGA
+volatile unsigned short* vga = (unsigned short*)0xB8000;
+
+void kernel_main(void) {
+    // Color: fondo azul (1), texto blanco (15)
+    unsigned char color = (1 << 4) | 15;
+    
+    const char* message = "Kernel en C funcionando!";
+    for (int i = 0; message[i] != 0; i++) {
+        vga[i] = (color << 8) | message[i];
+    }
+    
+    while(1) { __asm__("hlt"); }
+}
+```
+
+#### 4.3 Compilación del Kernel
+```bash
+# Compilar entry point
+nasm -f elf64 kernel/entry.asm -o build/entry.o
+
+# Compilar kernel en C
+x86_64-elf-gcc -std=c11 -ffreestanding \
+    -mno-red-zone -mno-mmx -mno-sse -mno-sse2 \
+    -c kernel/kernel.c -o build/kernel.o
+
+# Linkar con script personalizado
+x86_64-elf-ld -T kernel.ld -o build/kernel.elf \
+    build/entry.o build/kernel.o
+
+# Convertir ELF a binario plano
+x86_64-elf-objcopy -O binary build/kernel.elf build/kernel.bin
+```
+
+#### 4.4 Linker Script (kernel.ld)
+```ld
+OUTPUT_FORMAT(elf64-x86-64)
+ENTRY(_start)
+
+SECTIONS {
+    . = 0x10000;
+    
+    .text.entry : { *(.text.entry) }
+    .text : { *(.text) }
+    .rodata : { *(.rodata) }
+    .data : { *(.data) }
+    .bss : { *(.bss) }
+}
+```
+
+---
+
+### **Paso 5: Ensamblado Final del Sistema**
+
+```bash
+# 1. Compilar Stage1
+nasm -f bin -I boot/ boot/boot.asm -o build/boot.bin
+
+# 2. Compilar Stage2
+nasm -f bin -I boot/ boot/stage2_sector2.asm -o build/stage2_sector2.bin
+
+# 3. Compilar Kernel (ver Paso 4.3)
+
+# 4. Crear imagen de disco
+dd if=/dev/zero of=sector2.img bs=1M count=10
+
+# 5. Escribir Stage1 en sector 0
+dd if=build/boot.bin of=sector2.img conv=notrunc
+
+# 6. Escribir Stage2 en sectores 1-16
+dd if=build/stage2_sector2.bin of=sector2.img bs=512 seek=1 conv=notrunc
+
+# 7. Escribir Kernel en sector 17+
+dd if=build/kernel.bin of=sector2.img bs=512 seek=17 conv=notrunc
+
+# 8. Ejecutar en QEMU
+qemu-system-x86_64 -drive format=raw,file=sector2.img
+```
+
+---
+
+## 🔑 Conceptos Clave Aprendidos
+
+### 1. **Limitaciones del BIOS**
+- INT 0x13 solo funciona en modo real (16-bit)
+- Al entrar en modo protegido/largo, se pierde acceso al BIOS
+- Solución: drivers nativos que accedan hardware directamente
+
+### 2. **Por Qué Cargar el Kernel en 64-bit (no en Stage1)**
+- **Escalabilidad**: Stage1 tiene solo 512 bytes, muy limitado
+- **Flexibilidad**: Stage2 puede cargar kernels de cualquier tamaño
+- **Arquitectura limpia**: Separación de responsabilidades
+  - Stage1: bootstrapping mínimo
+  - Stage2: configuración del sistema
+  - Kernel: lógica del OS
+
+### 3. **Identity Paging**
+```
+Virtual Address = Physical Address
+Ejemplo: 0x10000 (virtual) → 0x10000 (física)
+```
+Necesario para que las direcciones del código sigan siendo válidas después de habilitar paginación.
+
+### 4. **Flags de Compilación para Kernel**
+- `-ffreestanding`: No asumir funciones estándar de C
+- `-mno-red-zone`: Deshabilitar red zone (requerido para kernel)
+- `-mno-sse`: Sin instrucciones SSE (requieren inicialización extra)
+
+---
 
 ## 📁 Estructura del Proyecto
 
 ```
-own_micro_os/
-├── boot/                    # Bootloader custom de 2 etapas
-│   ├── boot.asm            # Stage1: MBR bootloader (512 bytes)
-│   ├── stage2_sector2.asm  # Stage2: Transición a 64-bit mode
-│   ├── gdt.asm             # Tabla de Descriptores Globales
-│   ├── CPUID.asm           # Detección de capacidades del CPU
-│   ├── SimplePaging.asm    # Configuración de paginación identidad
-│   └── print.asm           # Funciones de impresión en modo real
-├── kernel/                  # Código del kernel
-│   ├── kernel_simple.asm   # Kernel simple en Assembly (✅ funcional)
-│   ├── kernel.c            # Kernel en C (🔄 en desarrollo)
-│   └── entry.asm           # Punto de entrada del kernel en C
-├── build/                   # Archivos compilados (.bin)
-├── sector2.img             # Imagen de disco booteable (10MB)
-├── .gitignore              # Archivos ignorados por Git
-└── README.md               # Este archivo
+.
+├── boot/
+│   ├── boot.asm              # Stage1: MBR bootloader
+│   ├── stage2_sector2.asm    # Stage2: transición 16→32→64 bit
+│   ├── ata_driver64.asm      # Driver ATA para lectura de disco
+│   ├── gdt.asm               # Global Descriptor Table
+│   ├── CPUID.asm             # Detección de características CPU
+│   ├── SimplePaging.asm      # Configuración de paginación
+│   └── print.asm             # Funciones de impresión 16-bit
+├── kernel/
+│   ├── entry.asm             # Entry point del kernel (64-bit)
+│   └── kernel.c              # Kernel principal en C
+├── build/
+│   ├── boot.bin              # Stage1 compilado
+│   ├── stage2_sector2.bin    # Stage2 compilado
+│   └── kernel.bin            # Kernel compilado
+├── kernel.ld                 # Linker script
+├── sector2.img               # Imagen de disco final
+└── README.md                 # Este archivo
 ```
 
-## 🚀 Compilación y Ejecución
+---
 
-### Requisitos
+## 🛠️ Requisitos
 
-- **macOS con Apple Silicon**: 
-  - `nasm` (ensamblador)
-  - `x86_64-elf-gcc` (cross-compiler para x86_64)
-  - `qemu-system-x86_64` (emulador)
+- **NASM**: Ensamblador para x86/x86-64
+- **GCC Cross-Compiler**: `x86_64-elf-gcc`, `x86_64-elf-ld`, `x86_64-elf-objcopy`
+- **QEMU**: `qemu-system-x86_64`
+- **dd**: Herramienta para escribir en disco (incluido en Unix/Linux/macOS)
+- **Make**: Sistema de construcción (incluido en Unix/Linux/macOS)
 
-Instalar con Homebrew:
+---
+
+## 🔧 Compilación y Ejecución
+
+### Usando Make (Recomendado)
+
+El proyecto incluye un Makefile que simplifica el proceso de compilación:
+
 ```bash
-brew install nasm qemu
-brew install x86_64-elf-gcc  # Cross-compiler necesario para Apple Silicon
+# Compilar todo el sistema
+make
+
+# Compilar y ejecutar en QEMU
+make run
+
+# Compilar desde cero y ejecutar
+make clean && make run
 ```
 
-### Compilar y Ejecutar
+### Comandos Make Disponibles
 
-Compilación completa y ejecución:
+| Comando | Descripción |
+|---------|-------------|
+| `make` | Compila todo el sistema (Stage1, Stage2, Kernel e imagen de disco) |
+| `make run` | Compila y ejecuta en QEMU |
+| `make clean` | Limpia todos los archivos compilados |
+| `make clean-obj` | Limpia solo archivos objeto (mantiene binarios) |
+| `make info` | Muestra información del kernel (tamaño, primeros bytes) |
+| `make verify` | Verifica que el kernel esté correctamente en el disco |
+| `make debug` | Inicia QEMU con servidor GDB para debugging |
+| `make kill` | Termina procesos QEMU colgados |
+| `make help` | Muestra ayuda completa con todos los comandos |
+
+### Compilación Manual (Opcional)
+
+Si prefieres compilar manualmente sin Make:
+
 ```bash
-pkill -9 qemu-system-x86_64 2>/dev/null
+# 1. Compilar Stage1
 nasm -f bin -I boot/ boot/boot.asm -o build/boot.bin
+
+# 2. Compilar Stage2
 nasm -f bin -I boot/ boot/stage2_sector2.asm -o build/stage2_sector2.bin
-nasm -f bin kernel/kernel_simple.asm -o build/kernel_simple.bin
 
-dd if=/dev/zero of=sector2.img bs=1M count=10 2>/dev/null
-dd if=build/boot.bin of=sector2.img conv=notrunc 2>/dev/null
-dd if=build/stage2_sector2.bin of=sector2.img bs=512 seek=1 conv=notrunc 2>/dev/null
-dd if=build/kernel_simple.bin of=sector2.img bs=512 seek=17 conv=notrunc 2>/dev/null
+# 3. Compilar Kernel
+nasm -f elf64 kernel/entry.asm -o build/entry.o
+x86_64-elf-gcc -std=c11 -ffreestanding -mno-red-zone -mno-mmx -mno-sse -mno-sse2 \
+    -c kernel/kernel.c -o build/kernel.o
+x86_64-elf-ld -T kernel.ld -o build/kernel.elf build/entry.o build/kernel.o
+x86_64-elf-objcopy -O binary build/kernel.elf build/kernel.bin
 
+# 4. Crear imagen de disco
+dd if=/dev/zero of=sector2.img bs=1M count=10
+dd if=build/boot.bin of=sector2.img conv=notrunc
+dd if=build/stage2_sector2.bin of=sector2.img bs=512 seek=1 conv=notrunc
+dd if=build/kernel.bin of=sector2.img bs=512 seek=17 conv=notrunc
+
+# 5. Ejecutar en QEMU
 qemu-system-x86_64 -drive format=raw,file=sector2.img
 ```
 
-### Layout del Disco
+### Debugging con GDB
 
-La imagen `sector2.img` tiene la siguiente distribución:
+Para hacer debugging del kernel:
 
-| Sector(es) | Contenido | Dirección de carga | Tamaño |
-|------------|-----------|-------------------|--------|
-| 0 | Stage1 (MBR) | 0x7C00 | 512 bytes |
-| 1-16 | Stage2 | 0x1000 | 8 KB |
-| 17+ | Kernel | 0x10000 | ~2 KB |
-
-## 🏗️ Proceso de Boot (Custom Bootloader)
-
-### Stage 1 (boot.asm)
-1. **BIOS** carga el MBR en 0x7C00
-2. **Stage1** se ejecuta:
-   - Limpia registros de segmento
-   - Guarda el número de drive
-   - Muestra "Loading Stage 2..."
-   - Carga 16 sectores (Stage2) desde sector 1 a 0x1000
-   - Carga 4 sectores (Kernel) desde sector 17 a 0x10000
-   - Salta a Stage2 en 0x1000
-
-### Stage 2 (stage2_sector2.asm)
-3. **Stage2** se ejecuta en modo real (16-bit):
-   - Habilita línea A20
-   - Carga GDT (Global Descriptor Table)
-   - **Entra a modo protegido (32-bit)**
-   
-4. En modo protegido (32-bit):
-   - Detecta CPUID y Long Mode (64-bit)
-   - Configura paginación identidad (0x70000)
-   - Modifica GDT para modo largo
-   - **Entra a modo largo (64-bit)**
-
-5. En modo largo (64-bit):
-   - Muestra "64-BIT MODE OK!" en pantalla azul
-   - **Salta al kernel** en 0x10000
-
-### Kernel (kernel_simple.asm)
-6. **Kernel** se ejecuta en modo 64-bit:
-   - Escribe "KERNEL OK!" directamente en VGA (0xB8000)
-   - Entra en loop infinito (cli/hlt)
-
-## 🎨 Filosofía de Microkernel
-
-El objetivo es mantener el kernel lo más pequeño posible, siguiendo estos principios:
-
-### En el Kernel (modo privilegiado):
-- ✅ Gestión básica de memoria
-- ✅ Scheduling de procesos
-- ✅ IPC (Inter-Process Communication)
-- ✅ Gestión de interrupciones
-
-### En Userspace (modo usuario):
-- 🔄 Drivers de dispositivos
-- 🔄 Sistema de archivos
-- 🔄 Servicios de red
-- 🔄 Gestores de ventanas
-
-## 📚 Estado Actual y Próximos Pasos
-
-### ✅ Completado
-- [x] Bootloader custom Stage1 (MBR)
-- [x] Bootloader custom Stage2 (transición a 64-bit)
-- [x] Detección de CPUID y Long Mode
-- [x] Configuración de GDT
-- [x] Paginación identidad
-- [x] Transición completa: 16-bit → 32-bit → 64-bit
-- [x] Carga del kernel desde disco
-- [x] Ejecución del kernel en modo 64-bit
-- [x] Driver VGA básico en Assembly
-
-### 🔄 En Progreso
-- [ ] Kernel en C con driver VGA
-- [ ] Tabla de Descriptores de Interrupción (IDT)
-- [ ] Manejo de excepciones y interrupciones
-
-### 📋 Próximas Fases
-
-#### Fase 2: Memoria
-- [ ] Gestión de memoria física (PMM)
-- [ ] Gestión de memoria virtual (VMM)
-- [ ] Heap del kernel
-- [ ] Allocator de memoria
-
-#### Fase 3: Procesos
-- [ ] Estructuras de datos para procesos
-- [ ] Context switching
-- [ ] Scheduler básico (round-robin)
-- [ ] Creación/destrucción de procesos
-
-#### Fase 4: IPC
-- [ ] Mecanismo de mensajes
-- [ ] Puertos de comunicación
-- [ ] Shared memory
-
-#### Fase 5: Userspace
-- [ ] Cambio a ring 3
-- [ ] System calls
-- [ ] Primeros servidores en userspace
-- [ ] Driver framework
-
-## � Detalles Técnicos
-
-### Memoria Layout
-```
-0x00000000 - 0x000003FF : Tabla de vectores de interrupción (IVT)
-0x00000400 - 0x000004FF : BIOS Data Area (BDA)
-0x00000500 - 0x00007BFF : Libre (usable)
-0x00007C00 - 0x00007DFF : Stage1 Bootloader (MBR)
-0x00001000 - 0x00002FFF : Stage2 Bootloader (8KB)
-0x00010000 - 0x0001FFFF : Kernel (cargado aquí)
-0x00070000 - 0x00073FFF : Page Tables (16KB)
-0x00090000 - 0x0009FFFF : Stack
-0x000A0000 - 0x000FFFFF : VGA y BIOS ROM
-0x000B8000             : VGA Text Mode Buffer
-```
-
-### GDT Configuration
-```
-Descriptor 0 (Null): 0x0000000000000000
-Descriptor 1 (Code): Base=0, Limit=0xFFFFF, Flags=9A (Executable, Readable)
-Descriptor 2 (Data): Base=0, Limit=0xFFFFF, Flags=92 (Writable)
-```
-
-### Paging Setup
-- Usa identity paging (dirección virtual = dirección física)
-- Mapea los primeros 2MB de memoria
-- Page tables en 0x70000 (evita conflicto con Stage2 en 0x1000)
-
-## 🔧 Debugging
-
-Para ver el estado del sistema en cada etapa, el bootloader muestra mensajes:
-- "Loading Stage 2..." (Stage1, modo real)
-- "OK" (Stage2 cargado)
-- "Kernel loaded" (Kernel cargado)
-- "64-BIT MODE OK!" (Stage2, modo 64-bit)
-- "KERNEL OK!" (Kernel ejecutándose)
-
-Para debugging más profundo con QEMU:
 ```bash
-qemu-system-x86_64 -drive format=raw,file=sector2.img -monitor stdio
+# Terminal 1: Iniciar QEMU en modo debug
+make debug
+
+# Terminal 2: Conectar GDB
+gdb -ex 'target remote localhost:1234' \
+    -ex 'break *0x10000' \
+    -ex 'continue'
 ```
 
-Para ver la salida serial:
-```bash
-qemu-system-x86_64 -drive format=raw,file=sector2.img -serial stdio
-```
+---
 
-## 📖 Referencias
+## 🎓 Próximos Pasos
+
+1. **IDT (Interrupt Descriptor Table)**: Manejo de interrupciones y excepciones
+2. **Memoria dinámica**: Implementar kalloc/kfree
+3. **Scheduler**: Multitarea cooperativa/preemptiva
+4. **Drivers**: Teclado, timer, etc.
+5. **IPC**: Comunicación entre procesos para arquitectura microkernel
+
+---
+
+## 📚 Referencias
 
 - [OSDev Wiki](https://wiki.osdev.org/)
-- [MINIX Operating System](https://www.minix3.org/)
-- [Intel 64 and IA-32 Architectures Software Developer Manuals](https://www.intel.com/content/www/us/en/developer/articles/technical/intel-sdm.html)
-- [AMD64 Architecture Programmer's Manual](https://www.amd.com/en/support/tech-docs)
-- [Repositorio base usado como referencia](https://github.com/rsamanez/os-dev)
-
-## 📝 Licencia
-
-Este proyecto es de código abierto para propósitos educativos.
+- [Intel® 64 and IA-32 Architectures Software Developer's Manual](https://www.intel.com/content/www/us/en/developer/articles/technical/intel-sdm.html)
+- [ATA PIO Mode](https://wiki.osdev.org/ATA_PIO_Mode)
 
 ---
 
-**Nota**: Este es un proyecto educativo para aprender sobre desarrollo de sistemas operativos desde cero, incluyendo el bootloader completo.
-- [MINIX Operating System](https://www.minix3.org/)
-- [Intel 64 and IA-32 Architectures Software Developer Manuals](https://www.intel.com/content/www/us/en/developer/articles/technical/intel-sdm.html)
-- [AMD64 Architecture Programmer's Manual](https://www.amd.com/en/support/tech-docs)
-
-## 📝 Licencia
-
-Este proyecto es de código abierto para propósitos educativos.
-
----
-
-**Nota**: Este es un proyecto educativo para aprender sobre desarrollo de sistemas operativos.
+**Autor**: Rommel Samanez (rsamanez@gmail.com)  
+**Fecha**: Noviembre 2025  
+**Licencia**: MIT
