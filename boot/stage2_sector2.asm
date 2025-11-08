@@ -1,6 +1,6 @@
 [org 0x1000]
 
-jmp EnterProtectedMode 
+jmp EnterProtectedMode
 
 %include "gdt.asm"
 %include "print.asm"
@@ -43,6 +43,12 @@ StartProtectedMode:
 	jmp codeseg:Start64Bit 
 
 [bits 64]
+
+%include "ata_driver64.asm"
+
+KERNEL_LBA equ 17           ; Sector donde inicia el kernel
+KERNEL_SECTORS equ 8        ; Cuántos sectores del kernel
+KERNEL_DEST equ 0x10000     ; Dónde cargar el kernel
 
 Start64Bit:
 	; Limpiar pantalla con azul
@@ -89,11 +95,84 @@ Start64Bit:
 	mov byte [rax+28], '!'
 	mov byte [rax+29], 0x0C
 	
-	; Saltar al kernel cargado en 0x10000
-	mov rax, 0x10000
+	; ===== CARGAR KERNEL DESDE DISCO EN MODO 64-BIT =====
+	; Mensaje de carga
+	mov rax, 0xB8000 + 160
+	mov byte [rax], 'L'
+	mov byte [rax+1], 0x0E
+	mov byte [rax+2], 'o'
+	mov byte [rax+3], 0x0E
+	mov byte [rax+4], 'a'
+	mov byte [rax+5], 0x0E
+	mov byte [rax+6], 'd'
+	mov byte [rax+7], 0x0E
+	mov byte [rax+8], 'i'
+	mov byte [rax+9], 0x0E
+	mov byte [rax+10], 'n'
+	mov byte [rax+11], 0x0E
+	mov byte [rax+12], 'g'
+	mov byte [rax+13], 0x0E
+	mov byte [rax+14], '.'
+	mov byte [rax+15], 0x0E
+	mov byte [rax+16], '.'
+	mov byte [rax+17], 0x0E
+	mov byte [rax+18], '.'
+	mov byte [rax+19], 0x0E
+	
+	; Cargar kernel usando driver ATA
+	mov rax, KERNEL_LBA         ; LBA inicial
+	mov rcx, KERNEL_SECTORS     ; Número de sectores
+	mov rdi, KERNEL_DEST        ; Dirección de destino
+	call ata_read_sectors
+	
+	; Verificar si hubo error
+	test rax, rax
+	jnz .load_error
+	
+	; Mensaje de éxito
+	mov rax, 0xB8000 + 320
+	mov byte [rax], 'K'
+	mov byte [rax+1], 0x0A
+	mov byte [rax+2], 'e'
+	mov byte [rax+3], 0x0A
+	mov byte [rax+4], 'r'
+	mov byte [rax+5], 0x0A
+	mov byte [rax+6], 'n'
+	mov byte [rax+7], 0x0A
+	mov byte [rax+8], 'e'
+	mov byte [rax+9], 0x0A
+	mov byte [rax+10], 'l'
+	mov byte [rax+11], 0x0A
+	mov byte [rax+12], ' '
+	mov byte [rax+13], 0x0A
+	mov byte [rax+14], 'O'
+	mov byte [rax+15], 0x0A
+	mov byte [rax+16], 'K'
+	mov byte [rax+17], 0x0A
+	mov byte [rax+18], '!'
+	mov byte [rax+19], 0x0A
+	
+	; Saltar al kernel
+	mov rax, KERNEL_DEST
 	jmp rax
 	
-	; Si el kernel retorna (no debería), loop infinito
+.load_error:
+	; Mensaje de error
+	mov rax, 0xB8000 + 320
+	mov byte [rax], 'E'
+	mov byte [rax+1], 0x0C
+	mov byte [rax+2], 'R'
+	mov byte [rax+3], 0x0C
+	mov byte [rax+4], 'R'
+	mov byte [rax+5], 0x0C
+	mov byte [rax+6], 'O'
+	mov byte [rax+7], 0x0C
+	mov byte [rax+8], 'R'
+	mov byte [rax+9], 0x0C
+	mov byte [rax+10], '!'
+	mov byte [rax+11], 0x0C
+	
+	; Loop infinito si hay error
 	cli
 	hlt
 

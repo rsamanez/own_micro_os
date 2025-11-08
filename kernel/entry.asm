@@ -3,7 +3,8 @@
 ; ============================================================================
 
 [BITS 64]
-[SECTION .text.entry]
+
+SECTION .text.entry
 
 extern kernel_main
 
