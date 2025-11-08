@@ -22,11 +22,12 @@ own_micro_os/
 │   ├── SimplePaging.asm    # Configuración de paginación identidad
 │   └── print.asm           # Funciones de impresión en modo real
 ├── kernel/                  # Código del kernel
-│   ├── kernel_simple.asm   # Kernel simple en Assembly (funcional)
-│   ├── kernel.c            # Kernel en C (en desarrollo)
-│   └── entry.asm           # Punto de entrada del kernel
-├── build/                   # Archivos compilados
+│   ├── kernel_simple.asm   # Kernel simple en Assembly (✅ funcional)
+│   ├── kernel.c            # Kernel en C (🔄 en desarrollo)
+│   └── entry.asm           # Punto de entrada del kernel en C
+├── build/                   # Archivos compilados (.bin)
 ├── sector2.img             # Imagen de disco booteable (10MB)
+├── .gitignore              # Archivos ignorados por Git
 └── README.md               # Este archivo
 ```
 
